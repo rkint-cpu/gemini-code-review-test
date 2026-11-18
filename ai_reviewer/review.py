@@ -1,20 +1,33 @@
-import json
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI, APIError, RateLimitError
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from pydantic import BaseModel
 
 load_dotenv()
 
-MODEL_NAME = "openai/gpt-oss-120b"
+MODEL_NAME = "gemini-2.5-flash"
 REPORT_FILE = Path("review_report.md")
 
 
+class CodeIssue(BaseModel):
+    severity: str
+    line: str
+    issue: str
+    fix: str
+
+
+class ReviewResponse(BaseModel):
+    issues: list[CodeIssue]
+
+
 def get_changed_files() -> list[str]:
-    """Return modified/added code files from git diff, falling back to project files."""
+    """Return modified/added code files from git diff."""
     try:
         base_ref = os.getenv("GITHUB_BASE_REF")
         diff_target = f"origin/{base_ref}...HEAD" if base_ref else "HEAD~1..HEAD"
@@ -63,24 +76,13 @@ def get_file_diff_or_content(filepath: str) -> str:
     return Path(filepath).read_text(encoding="utf-8", errors="ignore")
 
 
-def analyze_code(client: OpenAI, filepath: str, code_snippet: str) -> list[dict]:
-    """Send code/diff to Groq and parse structured JSON issues."""
+def analyze_code(client: genai.Client, filepath: str, code_snippet: str) -> list[CodeIssue]:
+    """Send code/diff to Gemini and parse structured Pydantic issues."""
     prompt = f"""You are a senior security and software engineer reviewing a pull request.
 Analyze the following git diff / code from `{filepath}` for security vulnerabilities, bugs, and performance issues.
 Ignore minor stylistic nitpicks. Focus ONLY on real defects.
-
-Return ONLY a valid JSON object with this exact schema:
-{{
-  "issues": [
-    {{
-      "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
-      "line": "line number or range",
-      "issue": "concise description of the bug or security flaw",
-      "fix": "concrete, actionable fix"
-    }}
-  ]
-}}
-If no issues are found, return {{"issues": []}}.
+Use severity values: CRITICAL, HIGH, MEDIUM, or LOW.
+If no issues are found, return an empty list of issues.
 
 Code / Diff for `{filepath}`:
 ---
@@ -89,34 +91,34 @@ Code / Diff for `{filepath}`:
 
     for attempt in range(3):
         try:
-            response = client.chat.completions.create(
+            response = client.models.generate_content(
                 model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "You are a strict code review assistant that outputs only valid JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=ReviewResponse,
+                ),
             )
-            raw_text = response.choices[0].message.content or '{"issues": []}'
-            data = json.loads(raw_text)
-            return data.get("issues", [])
-        except (RateLimitError, APIError) as e:
+            if response.parsed:
+                return response.parsed.issues
+            return []
+        except APIError as e:
             if attempt < 2:
                 wait = 2 ** (attempt + 1)
-                print(f"API rate limit/transient error on {filepath}, retrying in {wait}s: {e}")
+                print(f"Gemini API transient/rate-limit error on {filepath}, retrying in {wait}s: {e}")
                 time.sleep(wait)
             else:
                 print(f"Failed to analyze {filepath} after retries: {e}")
                 return []
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse JSON response for {filepath}: {e}")
+        except Exception as e:
+            print(f"Unexpected error analyzing {filepath}: {e}")
             return []
 
     return []
 
 
-def generate_markdown_report(findings: dict[str, list[dict]]) -> str:
+def generate_markdown_report(findings: dict[str, list[CodeIssue]]) -> str:
     """Format findings into a clean Markdown table for GitHub PR comments."""
     lines = ["## 🤖 AI Code Review Report\n"]
     total_issues = sum(len(items) for items in findings.values())
@@ -131,25 +133,22 @@ def generate_markdown_report(findings: dict[str, list[dict]]) -> str:
 
     for filepath, issues in findings.items():
         for item in issues:
-            sev = item.get("severity", "MEDIUM")
-            line = str(item.get("line", "-")).replace("|", "\\|")
-            desc = str(item.get("issue", "")).replace("|", "\\|").replace("\n", " ")
-            fix = str(item.get("fix", "")).replace("|", "\\|").replace("\n", " ")
+            sev = item.severity.upper()
+            line = str(item.line or "-").replace("|", "\\|")
+            desc = str(item.issue).replace("|", "\\|").replace("\n", " ")
+            fix = str(item.fix).replace("|", "\\|").replace("\n", " ")
             lines.append(f"| `{filepath}` | **{sev}** | {line} | {desc} | {fix} |")
 
     return "\n".join(lines)
 
 
 def main() -> int:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("Error: GROQ_API_KEY environment variable is not set.", file=sys.stderr)
+        print("Error: GEMINI_API_KEY environment variable is not set.", file=sys.stderr)
         return 1
 
-    client = OpenAI(
-        base_url="https://api.groq.com/openai/v1",
-        api_key=api_key,
-    )
+    client = genai.Client(api_key=api_key)
 
     files = get_changed_files()
     if not files:
@@ -161,7 +160,7 @@ def main() -> int:
         return 0
 
     print(f"Reviewing {len(files)} file(s): {', '.join(files)}")
-    all_findings: dict[str, list[dict]] = {}
+    all_findings: dict[str, list[CodeIssue]] = {}
 
     for filepath in files:
         content = get_file_diff_or_content(filepath)
