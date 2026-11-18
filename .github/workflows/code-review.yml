@@ -11,7 +11,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  gemini-review:
+  ai-review:
     runs-on: ubuntu-latest
 
     steps:
@@ -30,13 +30,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Gemini AI Code Review
+      - name: Run AI Code Review
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python -m ai_reviewer.review
+
+      - name: Publish Job Summary
+        if: hashFiles('review_report.md') != ''
+        run: cat review_report.md >> $GITHUB_STEP_SUMMARY
 
       - name: Comment Review on Pull Request
         if: github.event_name == 'pull_request' && hashFiles('review_report.md') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file review_report.md
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file review_report.md --edit-last --create-if-none
