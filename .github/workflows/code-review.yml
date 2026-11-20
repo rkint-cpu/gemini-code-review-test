@@ -2,9 +2,7 @@ name: AI Code Reviewer
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [ '**' ]
 
 permissions:
   contents: read
@@ -39,8 +37,12 @@ jobs:
         if: hashFiles('review_report.md') != ''
         run: cat review_report.md >> $GITHUB_STEP_SUMMARY
 
-      - name: Comment Review on Pull Request
-        if: github.event_name == 'pull_request' && hashFiles('review_report.md') != ''
+      - name: Comment Review on Open PR (if one exists)
+        if: hashFiles('review_report.md') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file review_report.md --edit-last --create-if-none
+        run: |
+          PR_NUM=$(gh pr list --head "${{ github.ref_name }}" --state open --json number --jq '.[0].number')
+          if [ -n "$PR_NUM" ]; then
+            gh pr comment "$PR_NUM" --body-file review_report.md --edit-last --create-if-none
+          fi
