@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from google import genai
@@ -8,7 +9,6 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel
 
-MODEL_NAME = "gemini-3.8-flash-lite"
 REPORT_FILE = Path("review_report.md")
 
 
@@ -78,19 +78,38 @@ def get_file_diff_or_content(filepath: str) -> str:
     return "\n".join(f"{idx}: {line}" for idx, line in enumerate(raw_lines, start=1))
 
 
-def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list[CodeIssue]:
+def get_candidate_models(client: genai.Client) -> list[str]:
+    preferred = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro-preview", "gemini-2.5-flash-lite"]
+    try:
+        available = []
+        for m in client.models.list():
+            methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            if "generateContent" in methods and "gemini" in name and "embedding" not in name and "image" not in name:
+                available.append(name)
+        ordered = [m for m in preferred if m in available]
+        for m in available:
+            if m not in ordered and ("flash" in m or "pro" in m):
+                ordered.append(m)
+        if ordered:
+            return ordered[:5]
+    except Exception as e:
+        print(f"Model discovery warning: {e}")
+    return preferred
+
+
+def analyze_file(client: genai.Client, filepath: str, code_content: str, candidate_models: list[str]) -> list[CodeIssue]:
     prompt = (
         f"You are an expert application security auditor. Analyze `{filepath}` for all security "
         "vulnerabilities (buffer overflows, gets(), format string bugs, command injection, SQL injection, "
         "integer overflows, use-after-free, double free, path traversal, hardcoded secrets) and critical bugs.\n"
-        "Use the exact line numbers shown at the start of each line.\n\n"
+        "Use the exact integer line number shown at the start of each line.\n\n"
         f"```\n{code_content}\n```"
     )
 
-    last_err = ""
-    models_to_try = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro"]
-    for attempt in range(3):
-        current_model = models_to_try[attempt % len(models_to_try)]
+    errors = []
+    for attempt in range(4):
+        current_model = candidate_models[attempt % len(candidate_models)]
         try:
             response = client.models.generate_content(
                 model=current_model,
@@ -109,47 +128,45 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list
                 data = json.loads(raw_text)
                 return [CodeIssue(**item) for item in data.get("issues", [])]
 
-            last_err = f"{current_model} returned an empty response."
+            errors.append(f"{current_model}: empty response")
         except APIError as e:
-            last_err = f"Gemini APIError ({e.code}) on {current_model}: {e.message}"
-            print(f"[Attempt {attempt + 1}/3] {last_err}")
-            time.sleep(3 * (attempt + 1))
+            msg = f"{current_model} ({e.code}): {e.message}"
+            errors.append(msg)
+            print(f"[Attempt {attempt + 1}/4] {msg}")
+            time.sleep(4 * (attempt + 1))
         except Exception as e:
-            last_err = f"Unexpected error on {current_model}: {type(e).__name__}: {e}"
-            print(f"[Attempt {attempt + 1}/3] {last_err}")
+            msg = f"{current_model} ({type(e).__name__}): {e}"
+            errors.append(msg)
+            print(f"[Attempt {attempt + 1}/4] {msg}")
             time.sleep(2)
 
     return [
         CodeIssue(
             severity="ERROR",
-            line="API",
-            issue=last_err or "Unknown Gemini failure",
-            fix="Verify GEMINI_API_KEY in Repo Settings -> Secrets -> Actions and check billing/quota.",
+            line="1",
+            issue="All model attempts failed: " + " | ".join(errors[-2:]),
+            fix="Check GEMINI_API_KEY quota/billing in Google AI Studio or re-run job after transient 503 spike.",
         )
     ]
+
+
+def parse_line_num(raw_line: str) -> int:
+    digits = "".join(ch for ch in str(raw_line).split("-")[0] if ch.isdigit())
+    return int(digits) if digits else 1
 
 
 def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        REPORT_FILE.write_text(
-            "<!-- AI-CODE-REVIEW-STICKY -->\n"
-            "## AI Code Review Report\n\n"
-            "| Severity | Line | Issue | Suggested Fix |\n| :--- | :--- | :--- | :--- |\n"
-            "| **ERROR** | `ENV` | `GEMINI_API_KEY` secret is missing or empty. | Add `GEMINI_API_KEY` in Settings -> Secrets and variables -> Actions. |\n",
-            encoding="utf-8",
-        )
-        return
+        print("::error::GEMINI_API_KEY secret is missing or empty.")
+        sys.exit(1)
 
     files = get_changed_files()
-    print(f"Reviewing files: {files}")
     client = genai.Client(api_key=api_key)
+    candidate_models = get_candidate_models(client)
 
-    commit_sha = os.getenv("GITHUB_SHA", "local")[:7]
-    report_sections = [
-        "<!-- AI-CODE-REVIEW-STICKY -->\n",
-        f"## AI Code Review Report (Latest Commit: `{commit_sha}`)\n",
-    ]
+    repo = os.getenv("GITHUB_REPOSITORY", "")
+    sha = os.getenv("GITHUB_SHA", "")
     total_issues = 0
 
     for filepath in files:
@@ -157,25 +174,21 @@ def main() -> None:
         if not content.strip():
             continue
 
-        issues = analyze_file(client, filepath, content)
-        total_issues += len(issues)
+        issues = analyze_file(client, filepath, content, candidate_models)
+        for item in issues:
+            total_issues += 1
+            line_num = parse_line_num(item.line)
+            msg = f"[{item.severity}] {item.issue} | Fix: {item.fix}".replace("\n", " ")
+            # Emits clickable inline error annotation directly on the file & line in GitHub PR
+            print(f"::error file={filepath},line={line_num}::{msg}")
+            if repo and sha:
+                print(f"-> Jump to code: https://github.com/{repo}/blob/{sha}/{filepath}#L{line_num}")
 
-        report_sections.append(f"### `{filepath}`\n")
-        if not issues:
-            report_sections.append("✅ No security vulnerabilities or critical bugs detected.\n")
-        else:
-            report_sections.append("| Severity | Line | Issue | Suggested Fix |\n")
-            report_sections.append("| :--- | :--- | :--- | :--- |\n")
-            for item in issues:
-                sev = item.severity.replace("|", "\\|").strip()
-                line = item.line.replace("|", "\\|").strip()
-                desc = item.issue.replace("|", "\\|").replace("\n", " ").strip()
-                fix = item.fix.replace("|", "\\|").replace("\n", " ").strip()
-                report_sections.append(f"| **{sev}** | `{line}` | {desc} | {fix} |\n")
-        report_sections.append("\n")
+    if total_issues > 0:
+        print(f"\nFailed: Found {total_issues} security/code error(s). Click any annotation above to jump directly to the line of code.")
+        sys.exit(1)
 
-    REPORT_FILE.write_text("".join(report_sections), encoding="utf-8")
-    print(f"Review complete. Found {total_issues} issue(s). Wrote {REPORT_FILE}.")
+    print("Passed: No security vulnerabilities or errors found.")
 
 
 if __name__ == "__main__":

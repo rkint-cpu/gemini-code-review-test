@@ -6,7 +6,8 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  checks: write
+  pull-requests: read
 
 jobs:
   ai-review:
@@ -30,21 +31,4 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: |
-          python ai_reviewer/review.py
-          cat review_report.md
-
-      - name: Update Top Sticky PR Comment
-        if: always() && hashFiles('review_report.md') != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUM: ${{ github.event.pull_request.number }}
-        run: |
-          echo "Target PR: $PR_NUM"
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq '[.[] | select(.user.type=="Bot")][0].id')
-          echo "Existing Bot Comment ID: $COMMENT_ID"
-          if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
-            gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@review_report.md
-          else
-            gh pr comment "$PR_NUM" --body-file review_report.md
-          fi
+        run: python ai_reviewer/review.py
