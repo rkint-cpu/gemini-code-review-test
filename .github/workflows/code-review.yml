@@ -1,8 +1,11 @@
-name: AI Code Reviewer
+﻿name: AI Code Reviewer
 
 on:
   push:
-    branches: [ '**' ]
+    branches-ignore:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -11,38 +14,42 @@ permissions:
 jobs:
   ai-review:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install google-genai pydantic
 
       - name: Run AI Code Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -m ai_reviewer.review
+        run: python -u -m ai_reviewer.review
 
       - name: Publish Job Summary
         if: hashFiles('review_report.md') != ''
         run: cat review_report.md >> $GITHUB_STEP_SUMMARY
 
-      - name: Comment Review on Open PR (if one exists)
+      - name: Comment Review on Open PR
         if: hashFiles('review_report.md') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUM=$(gh pr list --head "${{ github.ref_name }}" --state open --json number --jq '.[0].number')
-          if [ -n "$PR_NUM" ]; then
-            gh pr comment "$PR_NUM" --body-file review_report.md --edit-last --create-if-none
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --state open --json number --jq '.[0].number')
+          fi
+          echo "Target PR: $PR_NUMBER"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+            gh pr comment "$PR_NUMBER" --repo "${{ github.repository }}" --body-file review_report.md
+          else
+            echo "No open PR found for branch ${{ github.ref_name }}"
           fi
