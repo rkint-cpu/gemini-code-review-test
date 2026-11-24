@@ -8,7 +8,7 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3.8-flash-lite"
 REPORT_FILE = Path("review_report.md")
 
 
@@ -88,10 +88,12 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list
     )
 
     last_err = ""
+    models_to_try = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro"]
     for attempt in range(3):
+        current_model = models_to_try[attempt % len(models_to_try)]
         try:
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=current_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -102,21 +104,20 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list
             if response.parsed and getattr(response.parsed, "issues", None) is not None:
                 return response.parsed.issues
 
-            # Fallback if response.parsed is None: parse raw JSON text directly
             raw_text = (response.text or "").strip()
             if raw_text:
                 data = json.loads(raw_text)
                 return [CodeIssue(**item) for item in data.get("issues", [])]
 
-            last_err = "Gemini returned an empty response (check safety filter or API quota)."
+            last_err = f"{current_model} returned an empty response."
         except APIError as e:
-            last_err = f"Gemini APIError ({e.code}): {e.message}"
+            last_err = f"Gemini APIError ({e.code}) on {current_model}: {e.message}"
+            print(f"[Attempt {attempt + 1}/3] {last_err}")
+            time.sleep(3 * (attempt + 1))
+        except Exception as e:
+            last_err = f"Unexpected error on {current_model}: {type(e).__name__}: {e}"
             print(f"[Attempt {attempt + 1}/3] {last_err}")
             time.sleep(2)
-        except Exception as e:
-            last_err = f"Unexpected error: {type(e).__name__}: {e}"
-            print(f"[Attempt {attempt + 1}/3] {last_err}")
-            break
 
     return [
         CodeIssue(
@@ -132,6 +133,7 @@ def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         REPORT_FILE.write_text(
+            "<!-- AI-CODE-REVIEW-STICKY -->\n"
             "## AI Code Review Report\n\n"
             "| Severity | Line | Issue | Suggested Fix |\n| :--- | :--- | :--- | :--- |\n"
             "| **ERROR** | `ENV` | `GEMINI_API_KEY` secret is missing or empty. | Add `GEMINI_API_KEY` in Settings -> Secrets and variables -> Actions. |\n",
@@ -178,4 +180,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
