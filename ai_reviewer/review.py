@@ -127,7 +127,7 @@ def main() -> None:
     print(f"Reviewing files: {files}")
     client = genai.Client(api_key=api_key)
 
-    report_sections = ["## 🤖 AI Code Review Report\n"]
+    report_sections = ["## AI Code Review Report\n"]
     total_issues = 0
 
     for filepath in files:
@@ -138,7 +138,7 @@ def main() -> None:
         issues = analyze_file(client, filepath, content)
         total_issues += len(issues)
 
-        report_sections.append(f"### 📄 `{filepath}`\n")
+        report_sections.append(f"### `{filepath}`\n")
         if not issues:
             report_sections.append("✅ No security vulnerabilities or critical bugs detected.\n")
         else:
@@ -158,3 +158,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
