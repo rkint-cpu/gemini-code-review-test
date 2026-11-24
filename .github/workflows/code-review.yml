@@ -3,8 +3,6 @@
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: [c-prog-review]
 
 permissions:
   contents: read
@@ -32,19 +30,19 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: python ai_reviewer/review.py
+        run: |
+          python ai_reviewer/review.py
+          cat review_report.md
 
       - name: Update Top Sticky PR Comment
         if: always() && hashFiles('review_report.md') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
         run: |
-          PR_NUM=$(gh pr list --head c-prog-review --state open --json number --jq '.[0].number')
-          if [ -z "$PR_NUM" ]; then
-            echo "No open PR found for c-prog-review"
-            exit 0
-          fi
+          echo "Target PR: $PR_NUM"
           COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq '[.[] | select(.user.type=="Bot")][0].id')
+          echo "Existing Bot Comment ID: $COMMENT_ID"
           if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
             gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@review_report.md
           else
