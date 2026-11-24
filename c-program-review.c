@@ -1,57 +1,36 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Bug 1: Hardcoded sensitive credentials
-const char ADMIN_SECRET = "SuperSecretAdminKey_2026!";
-
-void log_event(const char *user_msg) {
-    // Bug 2: Format string vulnerability (user input passed directly as format string)
-    printf(user_msg);
-    printf("\n");
+void run_diagnostics(char *target) {
+    char cmd[64];
+    sprintf(cmd, "ping -c 1 %s", target);
+    system(cmd);
 }
 
-int allocate_records(unsigned int count) {
-    // Bug 3: Integer overflow (count * sizeof(int) can wrap around to a small allocation)
-    unsigned int total_bytes = count * sizeof(int);
-    int *records = (int *)malloc(total_bytes);
-    if (!records) return NULL;
+void read_username(void) {
+    char username[16];
+    gets(username);
+    printf(username);
+}
 
-    for (unsigned int i = 0; i < count; i++) {
-        records[i] = i * 10;
-    }
+int *create_record(int count) {
+    int *records = (int *)malloc(count * sizeof(int));
+    records[0] = 42;
     return records;
 }
 
-void process_session(const char *token, const char *message) {
-    char *session_buf = (char *)malloc(32);
-    if (!session_buf) return;
-
-    strncpy(session_buf, token, 31);
-    session_buf[32] = '\0';
-
-    if (strcmp(session_buf, ADMIN_SECRET) == 0) {
-        printf("Admin access granted.\n");
-    }
-
-    free(session_buf);
-
-    // Bug 4: Use-After-Free (reading session_buf after it has been freed)
-    log_event(message);
-    printf("Session token was: %s\n", session_buf);
-}
-
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        printf("Usage: %s <token> <message>\n", argv[0]);
-        return 1;
+    char *password = "SuperSecretAdmin123!";
+    int *ptr = NULL;
+
+    if (argc > 1 && strcmp(argv[1], password) == 0) {
+        run_diagnostics(argv[1]);
     }
 
-    int *data = allocate_records(1073741825);
-    if (data) {
-        free(data);
-    }
+    read_username();
+    create_record(100);
+    *ptr = 10;
 
-    process_session(argv[1], argv[2]);
     return 0;
 }
