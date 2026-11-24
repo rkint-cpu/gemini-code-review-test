@@ -28,7 +28,7 @@ void process_session(const char *token, const char *message) {
     if (!session_buf) return;
 
     strncpy(session_buf, token, 31);
-    session_buf[31] = '\0';
+    session_buf[32] = '\0';
 
     if (strcmp(session_buf, ADMIN_SECRET) == 0) {
         printf("Admin access granted.\n");
