@@ -1,6 +1,6 @@
+﻿import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 from google import genai
@@ -24,7 +24,6 @@ class ReviewResponse(BaseModel):
 
 
 def get_changed_files() -> list[str]:
-    """Return modified/added code files across push diff, PR diff, or last commit."""
     diff_candidates = []
     base_ref = os.getenv("GITHUB_BASE_REF")
     if base_ref:
@@ -65,31 +64,30 @@ def get_changed_files() -> list[str]:
         if path.suffix.lower() in allowed_exts:
             valid_files.append(f)
 
-    # Fallback: if only workflow/config files changed, still review any .c files on the branch
     if not valid_files:
-        for p in sorted(Path(".").glob("*.c")):
-            if p.is_file():
-                valid_files.append(str(p))
+        for ext in ("*.c", "*.cpp"):
+            for p in sorted(Path(".").glob(ext)):
+                if p.is_file():
+                    valid_files.append(str(p))
 
     return valid_files
 
 
 def get_file_diff_or_content(filepath: str) -> str:
-    """Return full numbered file content so Gemini sees complete context and exact line numbers."""
     raw_lines = Path(filepath).read_text(encoding="utf-8", errors="ignore").splitlines()
     return "\n".join(f"{idx}: {line}" for idx, line in enumerate(raw_lines, start=1))
 
 
 def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list[CodeIssue]:
-    """Send file content to Gemini and return structured security/bug findings."""
     prompt = (
-        f"You are an expert security and code reviewer. Analyze the following file (`{filepath}`) "
-        "for security vulnerabilities (buffer overflows, format strings, use-after-free, integer overflows, "
-        "hardcoded secrets, injection, memory leaks) and critical logic bugs.\n"
-        "Reference the exact line numbers shown at the start of each line.\n\n"
+        f"You are an expert application security auditor. Analyze `{filepath}` for all security "
+        "vulnerabilities (buffer overflows, gets(), format string bugs, command injection, SQL injection, "
+        "integer overflows, use-after-free, double free, path traversal, hardcoded secrets) and critical bugs.\n"
+        "Use the exact line numbers shown at the start of each line.\n\n"
         f"```\n{code_content}\n```"
     )
 
+    last_err = ""
     for attempt in range(3):
         try:
             response = client.models.generate_content(
@@ -101,33 +99,55 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str) -> list
                     temperature=0.1,
                 ),
             )
-            if response.parsed:
+            if response.parsed and getattr(response.parsed, "issues", None) is not None:
                 return response.parsed.issues
-            return []
+
+            # Fallback if response.parsed is None: parse raw JSON text directly
+            raw_text = (response.text or "").strip()
+            if raw_text:
+                data = json.loads(raw_text)
+                return [CodeIssue(**item) for item in data.get("issues", [])]
+
+            last_err = "Gemini returned an empty response (check safety filter or API quota)."
         except APIError as e:
-            print(f"Gemini API error on {filepath} (attempt {attempt + 1}/3): {e}")
+            last_err = f"Gemini APIError ({e.code}): {e.message}"
+            print(f"[Attempt {attempt + 1}/3] {last_err}")
             time.sleep(2)
         except Exception as e:
-            print(f"Unexpected error reviewing {filepath}: {e}")
+            last_err = f"Unexpected error: {type(e).__name__}: {e}"
+            print(f"[Attempt {attempt + 1}/3] {last_err}")
             break
-    return []
+
+    return [
+        CodeIssue(
+            severity="ERROR",
+            line="API",
+            issue=last_err or "Unknown Gemini failure",
+            fix="Verify GEMINI_API_KEY in Repo Settings -> Secrets -> Actions and check billing/quota.",
+        )
+    ]
 
 
 def main() -> None:
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable not set.")
-        sys.exit(1)
-
-    files = get_changed_files()
-    if not files:
-        print("No matching code files found to review.")
+        REPORT_FILE.write_text(
+            "## AI Code Review Report\n\n"
+            "| Severity | Line | Issue | Suggested Fix |\n| :--- | :--- | :--- | :--- |\n"
+            "| **ERROR** | `ENV` | `GEMINI_API_KEY` secret is missing or empty. | Add `GEMINI_API_KEY` in Settings -> Secrets and variables -> Actions. |\n",
+            encoding="utf-8",
+        )
         return
 
+    files = get_changed_files()
     print(f"Reviewing files: {files}")
     client = genai.Client(api_key=api_key)
 
-    report_sections = ["## 🤖 AI Code Review Report\n"]
+    commit_sha = os.getenv("GITHUB_SHA", "local")[:7]
+    report_sections = [
+        "<!-- AI-CODE-REVIEW-STICKY -->\n",
+        f"## AI Code Review Report (Latest Commit: `{commit_sha}`)\n",
+    ]
     total_issues = 0
 
     for filepath in files:
@@ -138,7 +158,7 @@ def main() -> None:
         issues = analyze_file(client, filepath, content)
         total_issues += len(issues)
 
-        report_sections.append(f"### 📄 `{filepath}`\n")
+        report_sections.append(f"### `{filepath}`\n")
         if not issues:
             report_sections.append("✅ No security vulnerabilities or critical bugs detected.\n")
         else:

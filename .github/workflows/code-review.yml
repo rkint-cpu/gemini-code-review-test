@@ -1,8 +1,10 @@
-name: AI Code Reviewer
+﻿name: AI Code Review
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
   push:
-    branches: [ '**' ]
+    branches: [c-prog-review]
 
 permissions:
   contents: read
@@ -11,9 +13,8 @@ permissions:
 jobs:
   ai-review:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -21,28 +22,31 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
+          python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install google-genai pydantic
 
       - name: Run AI Code Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python -m ai_reviewer.review
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: python ai_reviewer/review.py
 
-      - name: Publish Job Summary
-        if: hashFiles('review_report.md') != ''
-        run: cat review_report.md >> $GITHUB_STEP_SUMMARY
-
-      - name: Comment Review on Open PR (if one exists)
-        if: hashFiles('review_report.md') != ''
+      - name: Update Top Sticky PR Comment
+        if: always() && hashFiles('review_report.md') != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUM=$(gh pr list --head "${{ github.ref_name }}" --state open --json number --jq '.[0].number')
-          if [ -n "$PR_NUM" ]; then
-            gh pr comment "$PR_NUM" --body-file review_report.md --edit-last --create-if-none
+          PR_NUM=$(gh pr list --head c-prog-review --state open --json number --jq '.[0].number')
+          if [ -z "$PR_NUM" ]; then
+            echo "No open PR found for c-prog-review"
+            exit 0
+          fi
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq '[.[] | select(.user.type=="Bot")][0].id')
+          if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
+            gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@review_report.md
+          else
+            gh pr comment "$PR_NUM" --body-file review_report.md
           fi
