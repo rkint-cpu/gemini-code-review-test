@@ -9,8 +9,6 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel
 
-REPORT_FILE = Path("review_report.md")
-
 
 class CodeIssue(BaseModel):
     severity: str
@@ -79,13 +77,25 @@ def get_file_diff_or_content(filepath: str) -> str:
 
 
 def get_candidate_models(client: genai.Client) -> list[str]:
-    preferred = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-pro-preview", "gemini-2.5-flash-lite"]
+    preferred = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-3.8-flash-lite",
+    ]
     try:
         available = []
         for m in client.models.list():
             methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
             name = (getattr(m, "name", "") or "").replace("models/", "")
-            if "generateContent" in methods and "gemini" in name and "embedding" not in name and "image" not in name:
+            if (
+                "generateContent" in methods
+                and "gemini" in name
+                and "2.5" not in name
+                and "2.0" not in name
+                and "embedding" not in name
+                and "image" not in name
+            ):
                 available.append(name)
         ordered = [m for m in preferred if m in available]
         for m in available:
@@ -108,7 +118,7 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str, candida
     )
 
     errors = []
-    for attempt in range(4):
+    for attempt in range(5):
         current_model = candidate_models[attempt % len(candidate_models)]
         try:
             response = client.models.generate_content(
@@ -132,12 +142,12 @@ def analyze_file(client: genai.Client, filepath: str, code_content: str, candida
         except APIError as e:
             msg = f"{current_model} ({e.code}): {e.message}"
             errors.append(msg)
-            print(f"[Attempt {attempt + 1}/4] {msg}")
-            time.sleep(4 * (attempt + 1))
+            print(f"[Attempt {attempt + 1}/5] {msg}")
+            time.sleep(3 * (attempt + 1))
         except Exception as e:
             msg = f"{current_model} ({type(e).__name__}): {e}"
             errors.append(msg)
-            print(f"[Attempt {attempt + 1}/4] {msg}")
+            print(f"[Attempt {attempt + 1}/5] {msg}")
             time.sleep(2)
 
     return [
@@ -164,6 +174,7 @@ def main() -> None:
     files = get_changed_files()
     client = genai.Client(api_key=api_key)
     candidate_models = get_candidate_models(client)
+    print(f"Active models: {candidate_models}")
 
     repo = os.getenv("GITHUB_REPOSITORY", "")
     sha = os.getenv("GITHUB_SHA", "")
@@ -179,7 +190,6 @@ def main() -> None:
             total_issues += 1
             line_num = parse_line_num(item.line)
             msg = f"[{item.severity}] {item.issue} | Fix: {item.fix}".replace("\n", " ")
-            # Emits clickable inline error annotation directly on the file & line in GitHub PR
             print(f"::error file={filepath},line={line_num}::{msg}")
             if repo and sha:
                 print(f"-> Jump to code: https://github.com/{repo}/blob/{sha}/{filepath}#L{line_num}")
