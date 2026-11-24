@@ -3,7 +3,7 @@
 #include <string.h>
 
 // Bug 1: Hardcoded sensitive credentials
-const char *ADMIN_SECRET = "SuperSecretAdminKey_2026!";
+const char ADMIN_SECRET = "SuperSecretAdminKey_2026!";
 
 void log_event(const char *user_msg) {
     // Bug 2: Format string vulnerability (user input passed directly as format string)
@@ -11,7 +11,7 @@ void log_event(const char *user_msg) {
     printf("\n");
 }
 
-int *allocate_records(unsigned int count) {
+int allocate_records(unsigned int count) {
     // Bug 3: Integer overflow (count * sizeof(int) can wrap around to a small allocation)
     unsigned int total_bytes = count * sizeof(int);
     int *records = (int *)malloc(total_bytes);
