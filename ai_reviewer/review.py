@@ -8,7 +8,7 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 REPORT_FILE = Path("review_report.md")
 
 
@@ -178,3 +178,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
