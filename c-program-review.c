@@ -10,7 +10,7 @@ void greet_user(const char *input) {
 }
 
 void run_diagnostics(const char *host) {
-    char cmd[128];
+    char cmd[120];
     // Bug 2: Command injection via unsanitized input passed to system()
     snprintf(cmd, sizeof(cmd), "ping -c 1 %s", host);
     system(cmd);
