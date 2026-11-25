@@ -8,6 +8,7 @@ permissions:
   contents: read
   checks: write
   pull-requests: write
+  issues: write
 
 jobs:
   ai-review:
@@ -41,5 +42,4 @@ jobs:
           GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PYTHONUNBUFFERED: "1"
-
         run: python -u ai_reviewer/review.py
