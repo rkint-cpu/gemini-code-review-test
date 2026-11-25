@@ -2,29 +2,45 @@
 #include <string.h>
 #include <stdlib.h>
 
-int main() {
+int main(void) {
+
     char name[10];
 
-    // Test 1: Buffer Overflow
+    // Fix 1: Safe input using fgets()
     printf("Enter your name: ");
-    gets(name);
 
-    // Test 2: Hardcoded Password
-    char *password = "admin123";
+    if (fgets(name, sizeof(name), stdin) == NULL) {
+        printf("Input error.\n");
+        return 1;
+    }
 
-    // Test 3: Unsafe Command Execution
-    char command[100];
-    strcpy(command, "echo Hello");
-    system(command);
+    name[strcspn(name, "\n")] = '\0';
 
-    // Test 4: Integer Division
+    // Fix 2: Read password from environment variable
+    const char *password = getenv("APP_PASSWORD");
+
+    if (password == NULL) {
+        printf("Password is not configured.\n");
+    }
+
+    // Fix 3: Safe bounded string copy
+    char destination[5];
+
+    snprintf(destination, sizeof(destination), "%s", "Hello");
+
+    // Fix 4: Check divisor before division
     int a = 10;
-    int b = 0;
-    int result = a / b;
+    int b = 2;
+
+    if (b != 0) {
+        int result = a / b;
+        printf("Result: %d\n", result);
+    } else {
+        printf("Division by zero is not allowed.\n");
+    }
 
     printf("Name: %s\n", name);
-    printf("Password: %s\n", password);
-    printf("Result: %d\n", result);
+    printf("Copied string: %s\n", destination);
 
     return 0;
 }
