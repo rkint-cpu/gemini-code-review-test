@@ -7,7 +7,7 @@ const char *API_KEY = "TEST_API_KEY_123456";
 
 // 2. Buffer overflow
 void get_username(void) {
-    char username[16];
+    char username[16]
 
     printf("Enter username: ");
     gets(username);
