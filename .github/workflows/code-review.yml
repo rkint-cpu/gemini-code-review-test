@@ -3,16 +3,22 @@
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: [c-prog-review]
+
+# Cancel older reviews when a new commit is pushed
+concurrency:
+  group: security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
+  checks: write
   pull-requests: write
+  issues: write
 
 jobs:
   ai-review:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,23 +36,9 @@ jobs:
       - name: Run AI Code Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: python ai_reviewer/review.py
-
-      - name: Update Top Sticky PR Comment
-        if: always() && hashFiles('review_report.md') != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUM=$(gh pr list --head c-prog-review --state open --json number --jq '.[0].number')
-          if [ -z "$PR_NUM" ]; then
-            echo "No open PR found for c-prog-review"
-            exit 0
-          fi
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq '[.[] | select(.user.type=="Bot")][0].id')
-          if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
-            gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@review_report.md
-          else
-            gh pr comment "$PR_NUM" --body-file review_report.md
-          fi
