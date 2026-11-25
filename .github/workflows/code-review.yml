@@ -4,26 +4,23 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-# Cancel older reviews when a new commit is pushed
-concurrency:
-  group: security-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   checks: write
   pull-requests: write
-  issues: write
 
 jobs:
   ai-review:
+    name: AI Security Review
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,14 +28,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install google-genai pydantic
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai pydantic
 
       - name: Run AI Code Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python ai_reviewer/review.py
+          PYTHONUNBUFFERED: "1"
+
+        run: python -u ai_reviewer/review.py
