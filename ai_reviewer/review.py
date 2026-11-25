@@ -3,54 +3,25 @@ import os
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
+import urllib.error
 from pathlib import Path
 from urllib.parse import quote
 
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-
-# ==================================================
-# CONFIGURATION
-# ==================================================
-
-MODEL_NAME = "gemini-3.8-flash"
 
 REPORT_JSON = "review_report.json"
 REPORT_MD = "review_report.md"
-
 COMMENT_MARKER = "<!-- AI_SECURITY_REVIEW_REPORT -->"
 
-SUPPORTED_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".java", ".go", ".rs", ".cpp", ".c", ".h"
-}
-
-IGNORED_DIRECTORIES = {
-    ".git", ".github", "venv", ".venv",
-    "__pycache__", "node_modules"
-}
-
-IGNORED_FILES = {
-    "ai_reviewer/review.py",
-    "ai_reviewer/review_backup.py"
-}
-
-MAX_FILE_SIZE = 200_000
-MAX_ATTEMPTS = 3
-
-
-# ==================================================
-# AI RESPONSE SCHEMAS
-# ==================================================
 
 class CodeIssue(BaseModel):
     severity: str
-    line: int = Field(ge=1)
+    line: str
     issue: str
     fix: str
 
@@ -59,335 +30,297 @@ class ReviewResponse(BaseModel):
     issues: list[CodeIssue]
 
 
-# ==================================================
-# GET CHANGED FILES
-# ==================================================
-
-def get_changed_files():
-
+def get_changed_files() -> list[str]:
     base_ref = os.getenv("GITHUB_BASE_REF", "")
+    candidates = []
 
-    if not base_ref:
-        raise RuntimeError("GITHUB_BASE_REF is missing.")
+    if base_ref:
+        candidates.append(f"origin/{base_ref}...HEAD")
 
-    comparison = f"origin/{base_ref}...HEAD"
+    candidates.append("HEAD~1..HEAD")
 
-    print(f"Comparing changes: {comparison}", flush=True)
+    allowed_exts = {
+        ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".java", ".go", ".rs", ".cpp", ".c", ".h"
+    }
 
-    result = subprocess.run(
-        [
-            "git",
-            "diff",
-            "--name-only",
-            "--diff-filter=ACMRT",
-            comparison
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=True
-    )
+    ignored_dirs = {
+        ".git", ".github", "venv", ".venv",
+        "__pycache__", "node_modules"
+    }
 
-    files = []
+    for target in candidates:
+        try:
+            result = subprocess.run(
+                [
+                    "git", "diff", "--name-only",
+                    "--diff-filter=ACMRT", target
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
 
-    for filename in result.stdout.splitlines():
+            files = [
+                f.strip()
+                for f in result.stdout.splitlines()
+                if f.strip()
+            ]
 
-        filename = filename.strip()
+            valid_files = []
 
-        if not filename:
+            for filename in files:
+                path = Path(filename)
+
+                if not path.is_file():
+                    continue
+
+                if any(part in ignored_dirs for part in path.parts):
+                    continue
+
+                if path.suffix.lower() in allowed_exts:
+                    valid_files.append(filename)
+
+            return sorted(set(valid_files))
+
+        except subprocess.CalledProcessError:
             continue
 
-        if filename in IGNORED_FILES:
-            print(f"Skipping reviewer file: {filename}", flush=True)
-            continue
-
-        path = Path(filename)
-
-        if not path.is_file():
-            continue
-
-        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-
-        if any(part in IGNORED_DIRECTORIES for part in path.parts):
-            continue
-
-        if path.stat().st_size > MAX_FILE_SIZE:
-            print(f"Skipping oversized file: {filename}", flush=True)
-            continue
-
-        files.append(filename)
-
-    return sorted(set(files))
+    return []
 
 
-# ==================================================
-# READ SOURCE FILE
-# ==================================================
-
-def get_file_content(filepath):
-
-    lines = Path(filepath).read_text(
+def get_file_diff_or_content(filepath: str) -> str:
+    raw_lines = Path(filepath).read_text(
         encoding="utf-8",
-        errors="replace"
+        errors="ignore"
     ).splitlines()
 
-    numbered_lines = [
-        f"{number}: {line}"
-        for number, line in enumerate(lines, start=1)
+    return "\n".join(
+        f"{idx}: {line}"
+        for idx, line in enumerate(raw_lines, start=1)
+    )
+
+
+def get_candidate_models(client: genai.Client) -> list[str]:
+    preferred = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.1-pro-preview",
+        "gemini-3.8-flash-lite",
     ]
 
-    return "\n".join(numbered_lines)
+    try:
+        available = []
+
+        for model in client.models.list():
+            methods = (
+                getattr(model, "supported_actions", None)
+                or getattr(model, "supported_generation_methods", None)
+                or []
+            )
+
+            name = (
+                getattr(model, "name", "") or ""
+            ).replace("models/", "")
+
+            if (
+                "generateContent" in methods
+                and "gemini" in name
+                and "2.5" not in name
+                and "2.0" not in name
+                and "embedding" not in name
+                and "image" not in name
+            ):
+                available.append(name)
+
+        ordered = [
+            model for model in preferred
+            if model in available
+        ]
+
+        for model in available:
+            if model not in ordered and (
+                "flash" in model or "pro" in model
+            ):
+                ordered.append(model)
+
+        if ordered:
+            return ordered[:5]
+
+    except Exception as error:
+        print(f"Model discovery warning: {error}")
+
+    return preferred
 
 
-# ==================================================
-# GEMINI SECURITY REVIEW
-# ==================================================
+def analyze_file(
+    client: genai.Client,
+    filepath: str,
+    code_content: str,
+    candidate_models: list[str]
+) -> list[CodeIssue]:
 
-def analyze_file(client, filepath, content):
+    prompt = (
+        f"You are an expert application security auditor. "
+        f"Analyze `{filepath}` for security vulnerabilities including "
+        "buffer overflows, gets(), format string bugs, command injection, "
+        "SQL injection, integer overflows, use-after-free, double free, "
+        "path traversal and hardcoded secrets.\n\n"
 
-    prompt = f"""
-You are a senior application security engineer performing
-a careful source-code security audit.
+        "Inspect the entire supplied file carefully.\n"
+        "Report only genuine, actionable security issues.\n"
+        "Use the exact integer line number shown at the start of each line.\n"
+        "Severity must be Critical, High, Medium or Low.\n"
+        "Never invent line numbers.\n"
+        "Provide a clear explanation and a practical correction.\n\n"
 
-Review the following complete source file.
-
-FILE: {filepath}
-
-Look for genuine, exploitable security problems, including:
-
-1. Buffer overflows
-2. Unsafe strcpy, gets and memory operations
-3. Format string vulnerabilities
-4. OS command injection
-5. SQL injection
-6. Integer overflow
-7. Use-after-free
-8. Double-free
-9. Path traversal
-10. Hardcoded credentials and real secrets
-11. Insecure file handling
-12. Authentication and authorization weaknesses
-13. Other serious security vulnerabilities
-
-IMPORTANT RULES:
-
-- The source code has line numbers at the beginning of each line.
-- Return the exact source line number for every finding.
-- Never invent line numbers.
-- Only report real, actionable vulnerabilities.
-- Do not report safe code as vulnerable.
-- Do not report vulnerabilities that have already been fixed.
-- Do not report a dummy test placeholder as a real credential.
-- Explain the security impact clearly.
-- Give a practical correction for every finding.
-- Severity must be exactly one of:
-  Critical, High, Medium, Low.
-- If no vulnerabilities exist, return an empty issues list.
-- Do not return a general summary as a security finding.
-
-Return the result using the required JSON schema.
-
-SOURCE CODE:
-
-{content}
-"""
+        f"CODE:\n{code_content}"
+    )
 
     errors = []
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-
-        print(
-            f"Gemini review attempt {attempt}/{MAX_ATTEMPTS}: "
-            f"{MODEL_NAME}",
-            flush=True
-        )
+    for attempt in range(5):
+        current_model = candidate_models[
+            attempt % len(candidate_models)
+        ]
 
         try:
-
             response = client.models.generate_content(
-                model=MODEL_NAME,
+                model=current_model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=ReviewResponse,
-                    temperature=0.1
-                )
+                    temperature=0.1,
+                ),
             )
 
-            if response.parsed is not None:
-
-                parsed = response.parsed
-
-                if isinstance(parsed, ReviewResponse):
-                    return parsed.issues, ""
+            if (
+                response.parsed
+                and getattr(response.parsed, "issues", None) is not None
+            ):
+                return response.parsed.issues
 
             raw_text = (response.text or "").strip()
 
-            if not raw_text:
-                raise RuntimeError("Gemini returned an empty response.")
+            if raw_text:
+                data = json.loads(raw_text)
+                return [
+                    CodeIssue(**item)
+                    for item in data.get("issues", [])
+                ]
 
-            data = json.loads(raw_text)
-
-            parsed = ReviewResponse(**data)
-
-            return parsed.issues, ""
+            errors.append(f"{current_model}: empty response")
 
         except APIError as error:
-
             message = (
-                f"Gemini API error "
-                f"{getattr(error, 'code', 'unknown')}: {error}"
+                f"{current_model} ({error.code}): {error.message}"
+            )
+            errors.append(message)
+
+            print(
+                f"[Attempt {attempt + 1}/5] {message}"
             )
 
-            errors.append(message)
-
-            print(message, flush=True)
-
-            code = getattr(error, "code", None)
-
-            # Do not retry invalid model names, invalid requests,
-            # authentication failures or permission failures.
-            if code in (400, 401, 403, 404):
-                break
-
-        except (json.JSONDecodeError, ValueError) as error:
-
-            message = f"Invalid AI response: {error}"
-
-            errors.append(message)
-
-            print(message, flush=True)
-
-            break
+            if attempt < 4:
+                time.sleep(3 * (attempt + 1))
 
         except Exception as error:
-
             message = (
-                f"{type(error).__name__}: {error}"
+                f"{current_model} ({type(error).__name__}): {error}"
             )
-
             errors.append(message)
 
-            print(message, flush=True)
-
-        if attempt < MAX_ATTEMPTS:
-
-            delay = attempt * 5
-
             print(
-                f"Retrying in {delay} seconds...",
-                flush=True
+                f"[Attempt {attempt + 1}/5] {message}"
             )
 
-            time.sleep(delay)
+            if attempt < 4:
+                time.sleep(2)
 
-    return [], "AI REVIEW FAILED: " + " | ".join(errors)
-
-
-# ==================================================
-# VALIDATE FINDINGS
-# ==================================================
-
-def validate_issues(issues, filepath):
-
-    source_lines = Path(filepath).read_text(
-        encoding="utf-8",
-        errors="replace"
-    ).splitlines()
-
-    validated = []
-
-    allowed_severities = {
-        "CRITICAL", "HIGH", "MEDIUM", "LOW"
-    }
-
-    for issue in issues:
-
-        severity = issue.severity.upper().strip()
-
-        if severity not in allowed_severities:
-            print(
-                f"Ignoring invalid severity: {severity}",
-                flush=True
-            )
-            continue
-
-        line_number = issue.line
-
-        if not 1 <= line_number <= len(source_lines):
-            print(
-                f"Ignoring invalid line: {filepath}:{line_number}",
-                flush=True
-            )
-            continue
-
-        validated.append({
-            "severity": severity,
-            "line_number": line_number,
-            "issue": issue.issue,
-            "fix": issue.fix
-        })
-
-    return validated
+    return [
+        CodeIssue(
+            severity="ERROR",
+            line="1",
+            issue="Gemini review failed: " + " | ".join(errors),
+            fix="Check the Gemini API key, model availability, quota and billing. Retry the review.",
+        )
+    ]
 
 
-# ==================================================
-# CREATE SOURCE CODE LINKS
-# ==================================================
+def parse_line_num(raw_line: str) -> int:
+    digits = "".join(
+        ch for ch in str(raw_line).split("-")[0]
+        if ch.isdigit()
+    )
 
-def get_source_link(repo, sha, filepath, line_number):
+    return max(1, int(digits)) if digits else 1
+
+
+def escape_command(value: str) -> str:
+    return (
+        str(value)
+        .replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def get_source_link(
+    repo: str,
+    sha: str,
+    filepath: str,
+    line_num: int
+) -> str:
 
     encoded_path = quote(filepath, safe="/")
 
     return (
         f"https://github.com/{repo}/blob/"
-        f"{sha}/{encoded_path}#L{line_number}"
+        f"{sha}/{encoded_path}#L{line_num}"
     )
 
 
-# ==================================================
-# BUILD SECURITY REPORT
-# ==================================================
+def create_report(
+    results: list[dict],
+    repo: str,
+    sha: str
+) -> tuple[str, str]:
 
-def create_report(results, repo, sha):
-
-    all_issues = [
-        issue
-        for result in results
-        for issue in result["issues"]
+    issues = [
+        item for result in results
+        for item in result["issues"]
     ]
 
-    review_errors = [
-        result
-        for result in results
-        if result.get("error")
-    ]
+    error_count = sum(
+        item["severity"].upper() == "ERROR"
+        for item in issues
+    )
 
-    if review_errors:
+    if error_count:
         status = "ERROR"
-
-    elif all_issues:
+    elif issues:
         status = "FAILED"
-
     else:
         status = "PASSED"
 
-    severity_counts = {
+    counts = {
         severity: sum(
-            issue["severity"] == severity
-            for issue in all_issues
+            item["severity"].upper() == severity
+            for item in issues
         )
-        for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+        for severity in (
+            "CRITICAL", "HIGH", "MEDIUM", "LOW", "ERROR"
+        )
     }
 
     report = {
         "status": status,
         "repository": repo,
         "commit": sha,
-        "total_issues": len(all_issues),
-        "severity_counts": severity_counts,
-        "results": results
+        "total_issues": len(issues),
+        "severity_counts": counts,
+        "results": results,
     }
 
     Path(REPORT_JSON).write_text(
@@ -397,87 +330,54 @@ def create_report(results, repo, sha):
 
     lines = [
         COMMENT_MARKER,
-        "# AI Security Review Report",
+        "# AI Security Review",
         "",
         f"**Status:** {status}",
         "",
         f"**Commit reviewed:** `{sha}`",
         "",
-        f"**Files reviewed:** {len(results)}",
+        f"**Total findings:** {len(issues)}",
         "",
-        f"**Total findings:** {len(all_issues)}",
+        "## Security Summary",
         "",
-        "## Severity Summary",
-        "",
-        "| Severity | Findings |",
-        "|---|---:|"
+        "| Severity | Count |",
+        "|---|---:|",
     ]
 
-    for severity, count in severity_counts.items():
+    for severity, count in counts.items():
         lines.append(f"| {severity} | {count} |")
 
-    lines.extend([
-        "",
-        "## Detailed Findings",
-        ""
-    ])
+    lines.extend(["", "## Detected Issues", ""])
 
-    if not all_issues and not review_errors:
+    if not issues:
         lines.append(
             "No security vulnerabilities detected in the reviewed files."
         )
 
     for result in results:
-
         filepath = result["file"]
 
-        lines.extend([
-            f"### File: `{filepath}`",
-            ""
-        ])
-
-        if result.get("error"):
-
-            lines.extend([
-                "**Review error:**",
-                "",
-                result["error"],
-                ""
-            ])
-
-            continue
-
-        if not result["issues"]:
-
-            lines.extend([
-                "No security vulnerabilities detected.",
-                ""
-            ])
-
-            continue
-
-        for issue in result["issues"]:
-
-            line_number = issue["line_number"]
+        for item in result["issues"]:
+            severity = item["severity"].upper()
+            line_num = parse_line_num(item["line"])
 
             link = get_source_link(
-                repo,
-                sha,
-                filepath,
-                line_number
+                repo, sha, filepath, line_num
             )
 
             lines.extend([
-                f"#### {issue['severity']}: {issue['issue']}",
+                f"### {severity}: {item['issue']}",
                 "",
-                f"**Line:** {line_number}",
+                f"**File:** `{filepath}`",
                 "",
-                f"**Suggested fix:** {issue['fix']}",
+                f"**Line:** {line_num}",
+                "",
+                f"**Suggested fix:** {item['fix']}",
                 "",
                 f"[REFIX ERRORS - Open affected code]({link})",
                 "",
                 "---",
-                ""
+                "",
             ])
 
     lines.extend([
@@ -495,83 +395,51 @@ def create_report(results, repo, sha):
     return status, markdown
 
 
-# ==================================================
-# CREATE OR UPDATE PR COMMENT
-# ==================================================
-
-def update_pr_comment(markdown):
-
+def update_pr_comment(markdown: str) -> None:
     token = os.getenv("GITHUB_TOKEN", "")
     repo = os.getenv("GITHUB_REPOSITORY", "")
     pr_number = os.getenv("PR_NUMBER", "")
 
     if not token or not repo or not pr_number:
-
-        print(
-            "PR comment credentials are missing.",
-            flush=True
-        )
-
+        print("PR comment skipped: GitHub credentials unavailable.")
         return
+
+    api_base = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
 
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
-    comments_url = (
-        f"https://api.github.com/repos/{repo}"
-        f"/issues/{pr_number}/comments?per_page=100"
-    )
-
     try:
-
         request = urllib.request.Request(
-            comments_url,
-            headers=headers
+            f"{api_base}?per_page=100",
+            headers=headers,
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=20
-        ) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            comments = json.loads(response.read().decode("utf-8"))
 
-            comments = json.loads(
-                response.read().decode("utf-8")
-            )
-
-        existing = next(
+        existing_comment = next(
             (
-                comment
-                for comment in comments
+                comment for comment in comments
                 if COMMENT_MARKER in comment.get("body", "")
             ),
-            None
+            None,
         )
 
-        if existing:
-
+        if existing_comment:
             url = (
-                f"https://api.github.com/repos/{repo}"
-                f"/issues/comments/{existing['id']}"
+                f"{api_base}/{existing_comment['id']}"
             )
-
             method = "PATCH"
-
-            print("Updating existing AI review comment...", flush=True)
-
+            print("Updating existing PR security report.")
         else:
-
-            url = (
-                f"https://api.github.com/repos/{repo}"
-                f"/issues/{pr_number}/comments"
-            )
-
+            url = api_base
             method = "POST"
-
-            print("Creating AI review comment...", flush=True)
+            print("Creating new PR security report.")
 
         payload = json.dumps({
             "body": markdown
@@ -581,259 +449,117 @@ def update_pr_comment(markdown):
             url,
             data=payload,
             headers=headers,
-            method=method
+            method=method,
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=20
-        ) as response:
-
+        with urllib.request.urlopen(request, timeout=20) as response:
             print(
-                f"PR report published: HTTP {response.status}",
-                flush=True
+                f"PR security report published: HTTP {response.status}"
             )
 
     except Exception as error:
-
-        print(
-            f"PR comment publishing warning: {error}",
-            flush=True
-        )
+        print(f"PR comment warning: {error}")
+        print("The security review will continue.")
 
 
-# ==================================================
-# GITHUB ACTIONS SUMMARY
-# ==================================================
-
-def write_step_summary(markdown):
-
-    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
-
-    if not summary_path:
-        return
-
-    with open(
-        summary_path,
-        "a",
-        encoding="utf-8"
-    ) as file:
-
-        file.write(markdown)
-
-    print("GitHub Actions summary generated.", flush=True)
-
-
-# ==================================================
-# GITHUB INLINE ANNOTATIONS
-# ==================================================
-
-def escape_command(value):
-
-    return (
-        str(value)
-        .replace("%", "%25")
-        .replace("\r", "%0D")
-        .replace("\n", "%0A")
-        .replace(",", "%2C")
-        .replace(":", "%3A")
-    )
-
-
-def publish_annotations(results):
-
-    for result in results:
-
-        filepath = result["file"]
-
-        for issue in result["issues"]:
-
-            severity = issue["severity"]
-
-            level = (
-                "warning"
-                if severity in {"LOW", "MEDIUM"}
-                else "error"
-            )
-
-            message = (
-                f"[{severity}] {issue['issue']} "
-                f"| Suggested fix: {issue['fix']}"
-            )
-
-            print(
-                f"::{level} file={escape_command(filepath)},"
-                f"line={issue['line_number']}::"
-                f"{escape_command(message)}",
-                flush=True
-            )
-
-
-# ==================================================
-# MAIN
-# ==================================================
-
-def main():
-
+def main() -> None:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
     if not api_key:
-        print(
-            "::error::GEMINI_API_KEY is missing.",
-            flush=True
-        )
+        print("::error::GEMINI_API_KEY secret is missing.")
         sys.exit(1)
 
     repo = os.getenv("GITHUB_REPOSITORY", "")
-
     sha = (
         os.getenv("GITHUB_HEAD_SHA", "")
         or os.getenv("GITHUB_SHA", "")
     )
 
+    files = get_changed_files()
+
+    print(f"Changed files: {files}")
+
     results = []
 
-    print("Starting AI security review...", flush=True)
+    if files:
+        client = genai.Client(api_key=api_key)
+        candidate_models = get_candidate_models(client)
 
-    try:
+        print(f"Active models: {candidate_models}")
 
-        files = get_changed_files()
+        for filepath in files:
+            print(f"\nReviewing: {filepath}")
 
-        print(
-            f"Changed source files: {files}",
-            flush=True
-        )
+            content = get_file_diff_or_content(filepath)
 
-        if not files:
+            if not content.strip():
+                continue
+
+            issues = analyze_file(
+                client,
+                filepath,
+                content,
+                candidate_models
+            )
+
+            results.append({
+                "file": filepath,
+                "issues": [
+                    {
+                        "severity": issue.severity,
+                        "line": issue.line,
+                        "issue": issue.issue,
+                        "fix": issue.fix,
+                    }
+                    for issue in issues
+                ],
+            })
+
+    status, markdown = create_report(
+        results,
+        repo,
+        sha
+    )
+
+    # Publish the PR report before failing the job.
+    update_pr_comment(markdown)
+
+    total_issues = sum(
+        len(result["issues"])
+        for result in results
+    )
+
+    # Generate native GitHub inline annotations.
+    for result in results:
+        filepath = result["file"]
+
+        for issue in result["issues"]:
+            line_num = parse_line_num(issue["line"])
+
+            message = (
+                f"[{issue['severity']}] "
+                f"{issue['issue']} | Fix: {issue['fix']}"
+            )
+
+            message = escape_command(message)
+            safe_file = escape_command(filepath).replace(
+                ",", "%2C"
+            ).replace(":", "%3A")
 
             print(
-                "No supported changed source files found.",
-                flush=True
+                f"::error file={safe_file},line={line_num}::{message}"
             )
 
-        else:
+    print(f"\nSecurity review status: {status}")
+    print(f"Total findings: {total_issues}")
 
-            client = genai.Client(
-                api_key=api_key,
-                http_options=types.HttpOptions(
-                    timeout=45000
-                )
-            )
-
-            for filepath in files:
-
-                print(
-                    f"\nReviewing: {filepath}",
-                    flush=True
-                )
-
-                content = get_file_content(filepath)
-
-                if not content.strip():
-                    print("Skipping empty file.", flush=True)
-                    continue
-
-                issues, error = analyze_file(
-                    client,
-                    filepath,
-                    content
-                )
-
-                validated_issues = []
-
-                if not error:
-
-                    validated_issues = validate_issues(
-                        issues,
-                        filepath
-                    )
-
-                results.append({
-                    "file": filepath,
-                    "issues": [
-                        {
-                            "severity": issue["severity"],
-                            "line_number": issue["line_number"],
-                            "issue": issue["issue"],
-                            "fix": issue["fix"]
-                        }
-                        for issue in validated_issues
-                    ],
-                    "error": error
-                })
-
-                if error:
-
-                    print(
-                        f"Review failed for {filepath}: {error}",
-                        flush=True
-                    )
-
-                else:
-
-                    print(
-                        f"Review completed: {filepath}. "
-                        f"Findings: {len(validated_issues)}",
-                        flush=True
-                    )
-
-        status, markdown = create_report(
-            results,
-            repo,
-            sha
-        )
-
-        # Publish report before setting the final check result.
-        update_pr_comment(markdown)
-
-        write_step_summary(markdown)
-
-        publish_annotations(results)
-
-        total_findings = sum(
-            len(result["issues"])
-            for result in results
-        )
-
-        print("\n================================", flush=True)
-        print(f"SECURITY REVIEW STATUS: {status}", flush=True)
-        print(f"TOTAL FINDINGS: {total_findings}", flush=True)
-        print("================================", flush=True)
-
-        if status == "ERROR":
-
-            print(
-                "::error::AI security review failed. "
-                "Check the logs and report.",
-                flush=True
-            )
-
-            sys.exit(1)
-
-        if status == "FAILED":
-
-            print(
-                "::error::Security vulnerabilities detected. "
-                "Fix the reported issues before merging.",
-                flush=True
-            )
-
-            sys.exit(1)
-
-        print(
-            "PASSED: No security vulnerabilities detected.",
-            flush=True
-        )
-
-    except Exception as error:
-
-        print(
-            f"::error::Security review execution failed: "
-            f"{type(error).__name__}: {error}",
-            flush=True
-        )
-
+    if status == "ERROR":
         sys.exit(1)
+
+    if status == "FAILED":
+        sys.exit(1)
+
+    print("PASSED: No security vulnerabilities detected.")
 
 
 if __name__ == "__main__":
