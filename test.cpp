@@ -37,7 +37,7 @@ void setupDatabase()
     sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
 }
 
-// --------------------------------------------------
+
 // 1. SQL INJECTION
 // CWE-89
 // --------------------------------------------------
