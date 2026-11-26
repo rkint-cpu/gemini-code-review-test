@@ -2,22 +2,34 @@
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-  push:
-    branches: [c-prog-review]
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+concurrency:
+  group: security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
+  checks: write
   pull-requests: write
+  issues: write
 
 jobs:
   ai-review:
+    name: AI Security Review
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout code
+      - name: Checkout PR code
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,28 +37,19 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install google-genai pydantic
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install google-genai pydantic
 
       - name: Run AI Code Review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_BASE_REF: ${{ github.base_ref }}
-          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PYTHONUNBUFFERED: "1"
         run: python ai_reviewer/review.py
-
-      - name: Update Top Sticky PR Comment
-        if: always() && hashFiles('review_report.md') != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUM=$(gh pr list --head c-prog-review --state open --json number --jq '.[0].number')
-          if [ -z "$PR_NUM" ]; then
-            echo "No open PR found for c-prog-review"
-            exit 0
-          fi
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/$PR_NUM/comments --jq '[.[] | select(.user.type=="Bot")][0].id')
-          if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
-            gh api -X PATCH repos/${{ github.repository }}/issues/comments/$COMMENT_ID -F body=@review_report.md
-          else
-            gh pr comment "$PR_NUM" --body-file review_report.md
-          fi
