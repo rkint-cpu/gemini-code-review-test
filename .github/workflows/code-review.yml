@@ -49,6 +49,7 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_HEAD_REF: ${{ github.head_ref }}
           GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PYTHONUNBUFFERED: "1"
         run: python ai_reviewer/review.py

@@ -72,14 +72,27 @@ class ReviewResponse(BaseModel):
 
 def get_changed_files() -> list[str]:
 
-    base_ref = os.getenv("GITHUB_BASE_REF", "").strip()
+    head_sha = os.getenv("GITHUB_HEAD_SHA", "").strip()
 
-    if not base_ref:
-        raise RuntimeError("GITHUB_BASE_REF is missing.")
+    if not head_sha:
+        raise RuntimeError("GITHUB_HEAD_SHA is missing.")
 
-    target = f"origin/{base_ref}...HEAD"
+    # Find the parent of the latest PR commit.
+    before_result = subprocess.run(
+        ["git", "rev-parse", f"{head_sha}^"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True
+    )
 
-    print(f"Finding changed files: {target}", flush=True)
+    before_sha = before_result.stdout.strip()
+
+    print(
+        f"Finding files changed in latest commit: "
+        f"{before_sha[:8]}...{head_sha[:8]}",
+        flush=True
+    )
 
     result = subprocess.run(
         [
@@ -87,7 +100,8 @@ def get_changed_files() -> list[str]:
             "diff",
             "--name-only",
             "--diff-filter=ACMRT",
-            target
+            before_sha,
+            head_sha
         ],
         capture_output=True,
         text=True,
@@ -107,7 +121,10 @@ def get_changed_files() -> list[str]:
         path = Path(filename)
 
         if filename in IGNORED_FILES:
-            print(f"Skipping reviewer file: {filename}", flush=True)
+            print(
+                f"Skipping reviewer file: {filename}",
+                flush=True
+            )
             continue
 
         if not path.is_file():
@@ -123,7 +140,10 @@ def get_changed_files() -> list[str]:
             continue
 
         if path.stat().st_size > MAX_FILE_SIZE:
-            print(f"Skipping oversized file: {filename}", flush=True)
+            print(
+                f"Skipping oversized file: {filename}",
+                flush=True
+            )
             continue
 
         files.append(filename)
@@ -154,7 +174,10 @@ def get_file_content(filepath: str) -> str:
 
 def get_candidate_models(client: genai.Client) -> list[str]:
 
-    print("Discovering available Gemini models...", flush=True)
+    print(
+        "Discovering available Gemini models...",
+        flush=True
+    )
 
     available = []
 
@@ -266,7 +289,7 @@ IMPORTANT RULES:
 - Review the actual supplied code.
 - Use the exact line number shown at the start of each line.
 - Never invent line numbers.
-- Report only genuine, actionable vulnerabilities.
+- Report only genuine, actionable security issues.
 - Do not report safe operations as vulnerabilities.
 - Do not report vulnerabilities that have already been fixed.
 - Explain why each reported issue is dangerous.
@@ -312,7 +335,9 @@ def parse_response(response) -> list[CodeIssue]:
     raw_text = (response.text or "").strip()
 
     if not raw_text:
-        raise RuntimeError("Gemini returned an empty response.")
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
 
     if raw_text.startswith("```"):
 
@@ -411,7 +436,9 @@ def analyze_file(
         "All available Gemini models failed. "
         + " | ".join(errors)
     )
-    # ==================================================
+
+
+# ==================================================
 # LINE NUMBER VALIDATION
 # ==================================================
 
@@ -476,7 +503,7 @@ def validate_issues(
     return validated
 
 
-# ==================================================
+    # ==================================================
 # SOURCE CODE LINKS
 # ==================================================
 
@@ -594,34 +621,25 @@ def create_report(
         ])
 
         if result.get("error"):
-
             lines.extend([
                 "**Review error:**",
                 "",
                 result["error"],
                 ""
             ])
-
             continue
 
         if not result["issues"]:
-
             lines.extend([
                 "No security vulnerabilities detected.",
                 ""
             ])
-
             continue
 
         for issue in result["issues"]:
-
             line_num = issue["line_number"]
-
             link = get_source_link(
-                repo,
-                sha,
-                filepath,
-                line_num
+                repo, sha, filepath, line_num
             )
 
             lines.extend([
@@ -653,7 +671,7 @@ def create_report(
 
 
 # ==================================================
-# PUBLISH OR UPDATE PULL REQUEST COMMENT
+# UPDATE OR CREATE PR COMMENT
 # ==================================================
 
 def update_pr_comment(markdown: str) -> bool:
@@ -683,6 +701,7 @@ def update_pr_comment(markdown: str) -> bool:
     }).encode("utf-8")
 
     def send_request(url, method):
+
         request = urllib.request.Request(
             url,
             data=payload,
@@ -694,17 +713,18 @@ def update_pr_comment(markdown: str) -> bool:
             request,
             timeout=30
         ) as response:
+
             print(
                 f"PR report published: HTTP {response.status}",
                 flush=True
             )
+
             return True
 
     try:
-        # Fetch existing PR comments
+
         comments_url = (
-            f"{base_url}/issues/{pr_number}/comments"
-            "?per_page=100"
+            f"{base_url}/issues/{pr_number}/comments?per_page=100"
         )
 
         request = urllib.request.Request(
@@ -716,19 +736,22 @@ def update_pr_comment(markdown: str) -> bool:
             request,
             timeout=30
         ) as response:
+
             comments = json.loads(
                 response.read().decode("utf-8")
             )
 
         existing = next(
             (
-                comment for comment in comments
+                comment
+                for comment in comments
                 if COMMENT_MARKER in comment.get("body", "")
             ),
             None
         )
 
         if existing:
+
             comment_id = existing.get("id")
 
             update_url = (
@@ -741,9 +764,13 @@ def update_pr_comment(markdown: str) -> bool:
             )
 
             try:
-                return send_request(update_url, "PATCH")
+                return send_request(
+                    update_url,
+                    "PATCH"
+                )
 
             except urllib.error.HTTPError as error:
+
                 if error.code != 404:
                     raise
 
@@ -753,7 +780,6 @@ def update_pr_comment(markdown: str) -> bool:
                     flush=True
                 )
 
-        # Create a new PR comment
         create_url = (
             f"{base_url}/issues/{pr_number}/comments"
         )
@@ -763,9 +789,13 @@ def update_pr_comment(markdown: str) -> bool:
             flush=True
         )
 
-        return send_request(create_url, "POST")
+        return send_request(
+            create_url,
+            "POST"
+        )
 
     except urllib.error.HTTPError as error:
+
         details = error.read().decode(
             "utf-8",
             errors="replace"
@@ -780,6 +810,7 @@ def update_pr_comment(markdown: str) -> bool:
         return False
 
     except Exception as error:
+
         print(
             f"::error::Could not publish PR report: "
             f"{type(error).__name__}: {error}",
@@ -824,7 +855,7 @@ def write_step_summary(markdown: str) -> None:
 
 
 # ==================================================
-# GITHUB INLINE ANNOTATIONS
+# ESCAPE GITHUB ACTIONS COMMAND VALUES
 # ==================================================
 
 def escape_command(value: str) -> str:
@@ -838,6 +869,10 @@ def escape_command(value: str) -> str:
         .replace(":", "%3A")
     )
 
+
+# ==================================================
+# PUBLISH INLINE ANNOTATIONS
+# ==================================================
 
 def publish_annotations(results: list[dict]) -> None:
 
@@ -889,14 +924,20 @@ def main() -> None:
 
         sys.exit(1)
 
-    repo = os.getenv("GITHUB_REPOSITORY", "")
+    repo = os.getenv(
+        "GITHUB_REPOSITORY",
+        ""
+    )
 
     sha = (
         os.getenv("GITHUB_HEAD_SHA", "")
         or os.getenv("GITHUB_SHA", "")
     )
 
-    print("Starting AI security review...", flush=True)
+    print(
+        "Starting AI security review...",
+        flush=True
+    )
 
     results = []
 
@@ -925,7 +966,9 @@ def main() -> None:
                 )
             )
 
-            candidate_models = get_candidate_models(client)
+            candidate_models = get_candidate_models(
+                client
+            )
 
             for filepath in files:
 
@@ -985,8 +1028,9 @@ def main() -> None:
             sha
         )
 
-        # Publish report before returning a failing check.
-        comment_published = update_pr_comment(markdown)
+        comment_published = update_pr_comment(
+            markdown
+        )
 
         write_step_summary(markdown)
 
@@ -997,10 +1041,25 @@ def main() -> None:
             for result in results
         )
 
-        print("\n================================", flush=True)
-        print(f"SECURITY REVIEW STATUS: {status}", flush=True)
-        print(f"TOTAL FINDINGS: {total_issues}", flush=True)
-        print("================================", flush=True)
+        print(
+            "\n================================",
+            flush=True
+        )
+
+        print(
+            f"SECURITY REVIEW STATUS: {status}",
+            flush=True
+        )
+
+        print(
+            f"TOTAL FINDINGS: {total_issues}",
+            flush=True
+        )
+
+        print(
+            "================================",
+            flush=True
+        )
 
         if not comment_published:
 
