@@ -15,5 +15,5 @@ int main() {
 
     welcome_user(name);
 
-    return 0;
+    return 0
 }
